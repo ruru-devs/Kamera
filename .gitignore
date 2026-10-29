@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+build.old/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+
+# Qt / QML generated files
+.rcc/
+.qt/
+*.qmlc
+*.jsc
+*.moc
+moc_*.cpp
+*.moc.cpp
+qrc_*.cpp
+*_autogen/
+
+# User / System files
+*.user
+*.user.*
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.bak
+.directory
+
+# App runtime state & logs (if run locally)
+*.log
+*.log.*
+*.db
