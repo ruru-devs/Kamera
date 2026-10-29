@@ -38,6 +38,7 @@ add_executable(kamera
     src/fileops.cpp
     src/imagediskcache.cpp
     src/logger.cpp
+    src/videoutils.cpp
 )
 
 target_link_libraries(kamera

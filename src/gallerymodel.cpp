@@ -1,5 +1,6 @@
 #include "gallerymodel.h"
 #include "imagediskcache.h"
+#include "videoutils.h"
 
 #include <QStandardPaths>
 #include <QDir>
@@ -89,7 +90,7 @@ GalleryModel::GalleryModel(QObject *parent)
         loadFromDb();
         bool needsMore = false;
         for (const PhotoEntry &e : std::as_const(m_all)) {
-            if (!e.isVideo && (e.localThumb.isEmpty() || !QFile::exists(e.localThumb))) {
+            if (e.localThumb.isEmpty() || !QFile::exists(e.localThumb)) {
                 needsMore = true;
                 break;
             }
@@ -442,10 +443,10 @@ void GalleryModel::generateThumbs()
 {
     if (m_generatingThumbs) return;
 
-    // Collect entries that need a thumb (images only, videos get a placeholder)
+    // Collect entries that need a thumb (both images and videos)
     QList<PhotoEntry> todo;
     for (const PhotoEntry &e : std::as_const(m_all)) {
-        if (!e.isVideo && (e.localThumb.isEmpty() || !QFile::exists(e.localThumb)))
+        if (e.localThumb.isEmpty() || !QFile::exists(e.localThumb))
             todo << e;
     }
     if (todo.isEmpty()) return;
@@ -476,9 +477,15 @@ void GalleryModel::generateThumbs()
             if (QFile::exists(thumbPath)) {
                 thumbSaved = true;
             } else if (entry.url.isLocalFile()) {
-                QImageReader reader(entry.url.toLocalFile());
-                reader.setAutoTransform(true);
-                QImage img = reader.read();
+                QString localPath = entry.url.toLocalFile();
+                QImage img;
+                if (entry.isVideo) {
+                    img = VideoUtils::extractFirstFrame(localPath);
+                } else {
+                    QImageReader reader(localPath);
+                    reader.setAutoTransform(true);
+                    img = reader.read();
+                }
                 if (!img.isNull()) {
                     if (img.width() > 1024 || img.height() > 1024)
                         img = img.scaled(QSize(1024, 1024), Qt::KeepAspectRatio, Qt::SmoothTransformation);
@@ -504,7 +511,11 @@ void GalleryModel::generateThumbs()
 
                 if (!data.isEmpty()) {
                     QImage img;
-                    img.loadFromData(data);
+                    if (entry.isVideo) {
+                        img = VideoUtils::extractFirstFrameFromData(data);
+                    } else {
+                        img.loadFromData(data);
+                    }
                     if (!img.isNull()) {
                         if (img.width() > 1024 || img.height() > 1024)
                             img = img.scaled(QSize(1024, 1024), Qt::KeepAspectRatio, Qt::SmoothTransformation);
@@ -643,7 +654,11 @@ void GalleryModel::preloadNeighbors(int current, int distance)
 {
     if (current < 0 || m_filtered.isEmpty() || distance <= 0) return;
 
-    QList<QUrl> urlsToPreload;
+    struct PreloadTarget {
+        QUrl url;
+        bool isVideo;
+    };
+    QList<PreloadTarget> targets;
     const int total = m_filtered.size();
 
     // Preload next and prev `distance` neighbors (e.g. 4 ahead, 4 behind)
@@ -651,34 +666,38 @@ void GalleryModel::preloadNeighbors(int current, int distance)
         int nextIdx = (current + step) % total;
         int prevIdx = (current - step + total) % total;
 
-        if (nextIdx >= 0 && nextIdx < total && !m_filtered.at(nextIdx).isVideo) {
-            urlsToPreload.append(m_filtered.at(nextIdx).url);
+        if (nextIdx >= 0 && nextIdx < total) {
+            targets.append({m_filtered.at(nextIdx).url, m_filtered.at(nextIdx).isVideo});
         }
-        if (prevIdx >= 0 && prevIdx < total && prevIdx != nextIdx && !m_filtered.at(prevIdx).isVideo) {
-            urlsToPreload.append(m_filtered.at(prevIdx).url);
+        if (prevIdx >= 0 && prevIdx < total && prevIdx != nextIdx) {
+            targets.append({m_filtered.at(prevIdx).url, m_filtered.at(prevIdx).isVideo});
         }
     }
 
-    if (urlsToPreload.isEmpty()) return;
+    if (targets.isEmpty()) return;
 
-    QtConcurrent::run([urlsToPreload, this]() {
-        for (const QUrl &url : urlsToPreload) {
+    QtConcurrent::run([targets, this]() {
+        for (const auto &target : targets) {
             if (m_abort.load()) break;
-            const QString urlStr = url.toString();
+            const QString urlStr = target.url.toString();
             if (ImageDiskCache::contains(urlStr)) continue;
 
             QImage img;
-            if (url.isLocalFile() || !urlStr.contains(QStringLiteral("://"))) {
-                QString localPath = url.isLocalFile() ? url.toLocalFile() : urlStr;
-                QImageReader reader(localPath);
-                reader.setAutoTransform(true);
-                img = reader.read();
+            if (target.url.isLocalFile() || !urlStr.contains(QStringLiteral("://"))) {
+                QString localPath = target.url.isLocalFile() ? target.url.toLocalFile() : urlStr;
+                if (target.isVideo) {
+                    img = VideoUtils::extractFirstFrame(localPath);
+                } else {
+                    QImageReader reader(localPath);
+                    reader.setAutoTransform(true);
+                    img = reader.read();
+                }
             } else {
                 // Remote file
                 QByteArray data;
                 QEventLoop loop;
                 QMetaObject::invokeMethod(qApp, [&]() {
-                    auto *job = KIO::storedGet(url, KIO::NoReload, KIO::HideProgressInfo);
+                    auto *job = KIO::storedGet(target.url, KIO::NoReload, KIO::HideProgressInfo);
                     QObject::connect(job, &KIO::StoredTransferJob::result, [&](KJob *j) {
                         if (!j->error())
                             data = static_cast<KIO::StoredTransferJob *>(j)->data();
@@ -691,7 +710,11 @@ void GalleryModel::preloadNeighbors(int current, int distance)
                 if (m_abort.load()) break;
 
                 if (!data.isEmpty()) {
-                    img.loadFromData(data);
+                    if (target.isVideo) {
+                        img = VideoUtils::extractFirstFrameFromData(data);
+                    } else {
+                        img.loadFromData(data);
+                    }
                 }
             }
 

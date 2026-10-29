@@ -82,25 +82,26 @@ Item {
             anchors.margins: 24
             fillMode: Image.PreserveAspectFit
             asynchronous: true
-            visible: root.currentIndex >= 0 && !root.isVideoCurrent && Boolean(root.currentEntry && root.currentEntry.hasThumb) && (fullImage.status !== Image.Ready)
+            visible: root.currentIndex >= 0 && Boolean(root.currentEntry && root.currentEntry.hasThumb) && (fullImage.status !== Image.Ready)
             source: (root.currentEntry && root.currentEntry.hasThumb && root.currentEntry.localThumb)
                 ? "image://thumb/" + encodeURIComponent(root.currentEntry.localThumb)
                 : ""
         }
 
-        // Full rendered quality image. For local files, loaded directly via file URL.
-        // For remote files (e.g. kdeconnect://), loaded via the async KIO image://full/ provider.
+        // Full rendered quality image/first frame.
+        // For local files: loaded directly if image, or via image://full/ for video first frame.
+        // For remote files: loaded via the async KIO image://full/ provider.
         Image {
             id: fullImage
             anchors.fill: parent
             anchors.margins: 24
             fillMode: Image.PreserveAspectFit
             asynchronous: true
-            visible: root.currentIndex >= 0 && !root.isVideoCurrent && (status === Image.Ready)
+            visible: root.currentIndex >= 0 && (status === Image.Ready)
             source: {
-                if (root.currentIndex < 0 || root.isVideoCurrent || !root.currentEntry || !root.currentEntry.url)
+                if (root.currentIndex < 0 || !root.currentEntry || !root.currentEntry.url)
                     return ""
-                if (root.isLocalCurrent)
+                if (root.isLocalCurrent && !root.isVideoCurrent)
                     return root.currentEntry.url
                 return "image://full/" + encodeURIComponent(String(root.currentEntry.url))
             }
@@ -114,30 +115,39 @@ Item {
             }
         }
 
-        // Video: we don't build a player — open externally via FileOps,
-        // matching the "Share/open with" feature covering video for free.
-        Column {
+        // Video overlay: Large central Play button over the rendered first frame
+        Rectangle {
             anchors.centerIn: parent
             visible: root.currentIndex >= 0 && root.isVideoCurrent
-            spacing: 12
+            width: 88
+            height: 88
+            radius: 44
+            color: playArea.containsMouse ? "#DD1E1E2E" : "#AA11111B"
+            border.color: playArea.containsMouse ? Theme.accent : "#FFFFFF55"
+            border.width: 2
+
+            Behavior on color { ColorAnimation { duration: Theme.durationFast } }
+            Behavior on scale { NumberAnimation { duration: Theme.durationFast } }
+            scale: playArea.pressed ? 0.95 : (playArea.containsMouse ? 1.08 : 1.0)
 
             Text {
-                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.centerIn: parent
+                anchors.horizontalCenterOffset: 3 // visual centering for triangle play glyph
                 text: "▶"
-                color: Theme.textPrimary
-                font.pixelSize: 48
+                color: "#FFFFFF"
+                font.pixelSize: 34
             }
-            Text {
-                anchors.horizontalCenter: parent.horizontalCenter
-                text: qsTr("Video — open with default player")
-                color: Theme.textMuted
-                font.family: Theme.fontFamily
-                font.pixelSize: 13
-            }
-            Button {
-                anchors.horizontalCenter: parent.horizontalCenter
-                text: qsTr("Play")
-                onClicked: fileOps.openWith(currentEntry.url)
+
+            MouseArea {
+                id: playArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                    if (root.currentEntry) {
+                        fileOps.openWith(root.currentEntry.url)
+                    }
+                }
             }
         }
 

@@ -1,5 +1,6 @@
 #include "thumbnailprovider.h"
 #include "imagediskcache.h"
+#include "videoutils.h"
 
 #include <QImage>
 #include <QImageReader>
@@ -53,11 +54,17 @@ FullImageResponse::FullImageResponse(const QString &id, const QSize &requestedSi
 
         // 2. If not in cache, load from source
         if (img.isNull()) {
+            const bool isVideo = VideoUtils::isVideoFile(url.fileName().isEmpty() ? urlStr : url.fileName());
+
             if (url.isLocalFile() || !urlStr.contains(QStringLiteral("://"))) {
                 QString localPath = url.isLocalFile() ? url.toLocalFile() : urlStr;
-                QImageReader reader(localPath);
-                reader.setAutoTransform(true);
-                img = reader.read();
+                if (isVideo) {
+                    img = VideoUtils::extractFirstFrame(localPath);
+                } else {
+                    QImageReader reader(localPath);
+                    reader.setAutoTransform(true);
+                    img = reader.read();
+                }
             } else {
                 // Remote file (e.g. kdeconnect://): fetch data via KIO
                 QByteArray data;
@@ -76,7 +83,11 @@ FullImageResponse::FullImageResponse(const QString &id, const QSize &requestedSi
                 loop.exec();
 
                 if (!data.isEmpty()) {
-                    img.loadFromData(data);
+                    if (isVideo) {
+                        img = VideoUtils::extractFirstFrameFromData(data);
+                    } else {
+                        img.loadFromData(data);
+                    }
                 }
             }
 
