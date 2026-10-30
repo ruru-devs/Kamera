@@ -16,6 +16,8 @@ ApplicationWindow {
     // Single shared model instance for the whole app.
     GalleryModel {
         id: gallery
+        onError: (msg) => toast.show(msg, true)
+        onNotification: (msg) => toast.show(msg, false)
     }
 
     onClosing: {
@@ -78,6 +80,55 @@ ApplicationWindow {
                     viewer.openAt(index)
                 }
             }
+        }
+    }
+
+    // Toast notification banner
+    Rectangle {
+        id: toast
+        z: 200
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: parent.top
+        anchors.topMargin: 16
+        height: 36
+        radius: Theme.radiusMedium
+        color: isError ? "#E78284" : Theme.surfaceRaised
+        border.color: isError ? "#EA999C" : Theme.accent
+        border.width: 1
+        opacity: visible ? 1 : 0
+        visible: false
+
+        property bool isError: false
+
+        Behavior on opacity { NumberAnimation { duration: Theme.durationFast } }
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 16
+            anchors.rightMargin: 16
+            spacing: 8
+
+            Text {
+                id: toastText
+                color: toast.isError ? "#11111B" : Theme.textPrimary
+                font.family: Theme.fontFamily
+                font.pixelSize: 12
+                font.weight: Font.Medium
+            }
+        }
+
+        Timer {
+            id: toastTimer
+            interval: 3500
+            onTriggered: toast.visible = false
+        }
+
+        function show(msg, error = false) {
+            toastText.text = msg
+            toast.isError = error
+            toast.visible = true
+            toast.width = toastText.implicitWidth + 32
+            toastTimer.restart()
         }
     }
 }

@@ -19,11 +19,11 @@ namespace ImageDiskCache
                + QStringLiteral("/full_disk_cache");
     }
 
-    static QString cacheFilePath(const QString &urlStr)
+    static QString cacheFilePath(const QString &urlStr, bool png = false)
     {
         const QString hash = QString::fromLatin1(
             QCryptographicHash::hash(urlStr.toUtf8(), QCryptographicHash::Sha256).toHex());
-        return cacheDir() + QStringLiteral("/") + hash + QStringLiteral(".jpg");
+        return cacheDir() + QStringLiteral("/") + hash + (png ? QStringLiteral(".png") : QStringLiteral(".jpg"));
     }
 
     void put(const QString &urlStr, const QImage &img, int maxEntries)
@@ -37,8 +37,14 @@ namespace ImageDiskCache
             dir.mkpath(dirPath);
         }
 
-        const QString filePath = cacheFilePath(urlStr);
-        img.save(filePath, "JPEG", 92);
+        const bool hasAlpha = img.hasAlphaChannel();
+        const QString filePath = cacheFilePath(urlStr, hasAlpha);
+        
+        if (hasAlpha) {
+            img.save(filePath, "PNG");
+        } else {
+            img.save(filePath, "JPEG", 95);
+        }
 
         // LRU cleanup: prune oldest files exceeding maxEntries
         QFileInfoList files = dir.entryInfoList(QDir::Files, QDir::Time | QDir::Reversed);
@@ -51,8 +57,17 @@ namespace ImageDiskCache
     QImage get(const QString &urlStr)
     {
         QMutexLocker locker(&s_mutex);
-        const QString filePath = cacheFilePath(urlStr);
-        if (QFile::exists(filePath)) {
+        const QString pathPng = cacheFilePath(urlStr, true);
+        const QString pathJpg = cacheFilePath(urlStr, false);
+
+        QString filePath;
+        if (QFile::exists(pathPng)) {
+            filePath = pathPng;
+        } else if (QFile::exists(pathJpg)) {
+            filePath = pathJpg;
+        }
+
+        if (!filePath.isEmpty()) {
             // Touch file to update access/modification time for LRU
             QFile file(filePath);
             if (file.open(QIODevice::ReadWrite)) {
@@ -70,7 +85,7 @@ namespace ImageDiskCache
     bool contains(const QString &urlStr)
     {
         QMutexLocker locker(&s_mutex);
-        return QFile::exists(cacheFilePath(urlStr));
+        return QFile::exists(cacheFilePath(urlStr, true)) || QFile::exists(cacheFilePath(urlStr, false));
     }
 
     void clear()

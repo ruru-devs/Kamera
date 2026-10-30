@@ -1,6 +1,7 @@
 #include "gallerymodel.h"
 #include "imagediskcache.h"
 #include "videoutils.h"
+#include "kiohelper.h"
 
 #include <QStandardPaths>
 #include <QDir>
@@ -22,9 +23,10 @@
 #include <KIO/DeleteJob>
 #include <KIO/MkdirJob>
 #include <KIO/OpenUrlJob>
-#include <KIO/StoredTransferJob> // KIO::storedGet, used in generateThumb()
+#include <KIO/StoredTransferJob>
 #include <KIO/JobUiDelegateFactory>
 #include <KFileItem>
+#include <KNotification>
 #include <QAtomicInteger>
 
 // ──────────────────────────────────────────────
@@ -40,6 +42,10 @@ static QString photoId(const QUrl &url)
 
 static bool isMediaFile(const QString &filename)
 {
+    if (filename.startsWith(QLatin1Char('.'))) {
+        return false; // Skip dotfiles and Android temporary .trashed/.pending files
+    }
+
     static const QStringList imgExts = {
         QStringLiteral("jpg"), QStringLiteral("jpeg"),
         QStringLiteral("png"), QStringLiteral("webp"),
@@ -47,23 +53,8 @@ static bool isMediaFile(const QString &filename)
         QStringLiteral("bmp"), QStringLiteral("gif"),
         QStringLiteral("tiff"), QStringLiteral("tif"),
     };
-    static const QStringList vidExts = {
-        QStringLiteral("mp4"), QStringLiteral("mkv"),
-        QStringLiteral("mov"), QStringLiteral("avi"),
-        QStringLiteral("webm"), QStringLiteral("3gp"),
-    };
     const QString ext = QFileInfo(filename).suffix().toLower();
-    return imgExts.contains(ext) || vidExts.contains(ext);
-}
-
-static bool isVideoFile(const QString &filename)
-{
-    static const QStringList vidExts = {
-        QStringLiteral("mp4"), QStringLiteral("mkv"),
-        QStringLiteral("mov"), QStringLiteral("avi"),
-        QStringLiteral("webm"), QStringLiteral("3gp"),
-    };
-    return vidExts.contains(QFileInfo(filename).suffix().toLower());
+    return imgExts.contains(ext) || VideoUtils::isVideoFile(filename);
 }
 
 // ──────────────────────────────────────────────
@@ -73,8 +64,9 @@ static bool isVideoFile(const QString &filename)
 GalleryModel::GalleryModel(QObject *parent)
     : QAbstractListModel(parent)
 {
-    m_scanWatcher  = new QFutureWatcher<void>(this);
-    m_thumbWatcher = new QFutureWatcher<void>(this);
+    m_scanWatcher    = new QFutureWatcher<void>(this);
+    m_thumbWatcher   = new QFutureWatcher<void>(this);
+    m_preloadWatcher = new QFutureWatcher<void>(this);
 
     connect(m_scanWatcher, &QFutureWatcher<void>::finished, this, [this]() {
         m_scanning = false;
@@ -88,15 +80,17 @@ GalleryModel::GalleryModel(QObject *parent)
         m_generatingThumbs = false;
         emit generatingThumbsChanged();
         loadFromDb();
+
         bool needsMore = false;
         for (const PhotoEntry &e : std::as_const(m_all)) {
-            if (e.localThumb.isEmpty() || !QFile::exists(e.localThumb)) {
+            if (!e.hasThumb && !e.thumbFailed && !m_failedThumbIds.contains(e.id)) {
                 needsMore = true;
                 break;
             }
         }
-        if (needsMore)
+        if (needsMore && !m_abort.load()) {
             generateThumbs();
+        }
     });
 
     connect(this, &GalleryModel::thumbReady, this, [this](const QString &id) {
@@ -104,12 +98,16 @@ GalleryModel::GalleryModel(QObject *parent)
         for (auto &e : m_all) {
             if (e.id == id) {
                 e.localThumb = thumbPath;
+                e.hasThumb = true;
+                e.thumbFailed = false;
                 break;
             }
         }
         for (int i = 0; i < m_filtered.size(); ++i) {
             if (m_filtered[i].id == id) {
                 m_filtered[i].localThumb = thumbPath;
+                m_filtered[i].hasThumb = true;
+                m_filtered[i].thumbFailed = false;
                 emit dataChanged(index(i), index(i), {HasThumbRole, LocalThumbRole});
                 break;
             }
@@ -125,16 +123,29 @@ GalleryModel::GalleryModel(QObject *parent)
 GalleryModel::~GalleryModel()
 {
     cancelBackgroundTasks();
+    if (m_scanWatcher) {
+        m_scanWatcher->waitForFinished();
+    }
+    if (m_thumbWatcher) {
+        m_thumbWatcher->waitForFinished();
+    }
+    if (m_preloadWatcher) {
+        m_preloadWatcher->waitForFinished();
+    }
 }
 
 void GalleryModel::cancelBackgroundTasks()
 {
     m_abort.store(true);
+    m_preloadAbort.store(true);
     if (m_scanWatcher) {
         m_scanWatcher->cancel();
     }
     if (m_thumbWatcher) {
         m_thumbWatcher->cancel();
+    }
+    if (m_preloadWatcher) {
+        m_preloadWatcher->cancel();
     }
 }
 
@@ -165,18 +176,29 @@ void GalleryModel::initDb()
     }
 
     QSqlQuery q(m_db);
+    q.exec(QStringLiteral("PRAGMA journal_mode = WAL;"));
+    q.exec(QStringLiteral("PRAGMA synchronous = NORMAL;"));
+
     q.exec(QStringLiteral(R"sql(
         CREATE TABLE IF NOT EXISTS photos (
-            id          TEXT PRIMARY KEY,
-            url         TEXT NOT NULL,
-            filename    TEXT,
-            date_taken  TEXT,
-            folder      TEXT,
-            file_size   INTEGER,
-            is_video    INTEGER,
-            local_thumb TEXT
+            id           TEXT PRIMARY KEY,
+            url          TEXT NOT NULL UNIQUE,
+            filename     TEXT,
+            date_taken   TEXT,
+            folder       TEXT,
+            file_size    INTEGER,
+            is_video     INTEGER,
+            local_thumb  TEXT,
+            thumb_failed INTEGER DEFAULT 0
         )
     )sql"));
+
+    // Migration in case column doesn't exist yet
+    q.exec(QStringLiteral("ALTER TABLE photos ADD COLUMN thumb_failed INTEGER DEFAULT 0;"));
+
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder);"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken);"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_photos_url ON photos(url);"));
 
     q.exec(QStringLiteral(R"sql(
         CREATE TABLE IF NOT EXISTS watched_folders (
@@ -184,7 +206,7 @@ void GalleryModel::initDb()
         )
     )sql"));
 
-    // Clean up any corrupt rows from previous bug where folder URL was saved as photo URL
+    // Clean up any corrupt rows where folder URL was accidentally saved as photo URL
     q.exec(QStringLiteral(
         "DELETE FROM photos WHERE url IN (SELECT path FROM watched_folders) "
         "OR url IN (SELECT rtrim(path, '/') FROM watched_folders) "
@@ -200,46 +222,55 @@ void GalleryModel::initDb()
 
 void GalleryModel::loadFromDb()
 {
-    if (!m_db.isOpen()) return;
+    beginResetModel();
+    m_all.clear();
 
     QSqlQuery q(m_db);
     q.exec(QStringLiteral(
-        "SELECT id, url, filename, date_taken, folder, file_size, is_video, local_thumb "
-        "FROM photos ORDER BY date_taken DESC"));
+        "SELECT id, url, filename, date_taken, folder, file_size, is_video, local_thumb, thumb_failed "
+        "FROM photos ORDER BY date_taken DESC"
+    ));
 
-    QList<PhotoEntry> all;
+    const QString cacheDir = thumbCacheDir();
+
     while (q.next()) {
         PhotoEntry e;
-        e.id         = q.value(0).toString();
-        e.url        = QUrl(q.value(1).toString());
-        e.filename   = q.value(2).toString();
-        e.dateTaken  = QDateTime::fromString(q.value(3).toString(), Qt::ISODate);
-        e.folder     = q.value(4).toString();
-        e.fileSize   = q.value(5).toLongLong();
-        e.isVideo    = q.value(6).toBool();
-        e.localThumb = q.value(7).toString();
-        all << e;
+        e.id          = q.value(0).toString();
+        e.url         = QUrl(q.value(1).toString());
+        e.filename    = q.value(2).toString();
+        e.dateTaken   = QDateTime::fromString(q.value(3).toString(), Qt::ISODate);
+        e.folder      = q.value(4).toString();
+        e.fileSize    = q.value(5).toLongLong();
+        e.isVideo     = q.value(6).toInt() == 1;
+        e.localThumb  = q.value(7).toString();
+        e.thumbFailed = q.value(8).toInt() == 1;
+
+        if (e.localThumb.isEmpty()) {
+            const QString candidate = cacheDir + QStringLiteral("/") + e.id + QStringLiteral(".jpg");
+            if (QFile::exists(candidate)) {
+                e.localThumb = candidate;
+            }
+        }
+
+        e.hasThumb = !e.localThumb.isEmpty() && QFile::exists(e.localThumb);
+        m_all.append(e);
     }
 
-    beginResetModel();
-    m_all = all;
     applyFilter();
     endResetModel();
     emit countChanged();
 }
 
-// ── Filter ────────────────────────────────────
-
 void GalleryModel::applyFilter()
 {
+    m_filtered.clear();
     if (m_viewMode == QLatin1String("folder") && !m_activeFolder.isEmpty()) {
-        m_filtered.clear();
-        for (const auto &e : std::as_const(m_all)) {
+        for (const PhotoEntry &e : std::as_const(m_all)) {
             if (e.folder == m_activeFolder)
-                m_filtered << e;
+                m_filtered.append(e);
         }
     } else {
-        m_filtered = m_all;  // date mode: show everything, sorted by date (already is)
+        m_filtered = m_all;
     }
 }
 
@@ -251,31 +282,30 @@ int GalleryModel::rowCount(const QModelIndex &parent) const
     return m_filtered.size();
 }
 
-QVariant GalleryModel::data(const QModelIndex &idx, int role) const
+QVariant GalleryModel::data(const QModelIndex &index, int role) const
 {
-    if (!idx.isValid() || idx.row() >= m_filtered.size())
+    if (!index.isValid() || index.row() < 0 || index.row() >= m_filtered.size())
         return {};
 
-    const PhotoEntry &e = m_filtered.at(idx.row());
+    const PhotoEntry &e = m_filtered.at(index.row());
     switch (role) {
-    case UrlRole:       return e.url;
-    case FilenameRole:  return e.filename;
-    case DateTakenRole: return e.dateTaken;
-    case DateStringRole:
-        return e.dateTaken.isValid()
-               ? e.dateTaken.toString(QStringLiteral("yyyy-MM-dd"))
-               : QStringLiteral("Unknown date");
-    case FolderRole:    return e.folder;
-    case IsVideoRole:   return e.isVideo;
-    case LocalThumbRole:return e.localThumb;
-    case HasThumbRole:  return !e.localThumb.isEmpty() && QFile::exists(e.localThumb);
+    case IdRole:         return e.id;
+    case UrlRole:        return e.url.toString();
+    case FilenameRole:   return e.filename;
+    case DateTakenRole:  return e.dateTaken;
+    case DateStringRole: return e.dateTaken.toString(QStringLiteral("dd MMM yyyy"));
+    case FolderRole:     return e.folder;
+    case IsVideoRole:    return e.isVideo;
+    case LocalThumbRole: return e.localThumb;
+    case HasThumbRole:   return e.hasThumb;
+    default:             return {};
     }
-    return {};
 }
 
 QHash<int, QByteArray> GalleryModel::roleNames() const
 {
     return {
+        {IdRole,         "id"},
         {UrlRole,        "url"},
         {FilenameRole,   "filename"},
         {DateTakenRole,  "dateTaken"},
@@ -287,151 +317,182 @@ QHash<int, QByteArray> GalleryModel::roleNames() const
     };
 }
 
-// ── Watched folders ───────────────────────────
+// ── Watched Folders ───────────────────────────
 
 void GalleryModel::addWatchedFolder(const QString &kioPath)
 {
-    if (m_watchedFolders.contains(kioPath)) return;
+    if (kioPath.isEmpty() || m_watchedFolders.contains(kioPath)) return;
+
     m_watchedFolders << kioPath;
+    emit watchedFoldersChanged();
 
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("INSERT OR IGNORE INTO watched_folders (path) VALUES (?)"));
     q.addBindValue(kioPath);
     q.exec();
 
-    emit watchedFoldersChanged();
     scan();
 }
 
 void GalleryModel::removeWatchedFolder(const QString &kioPath)
 {
+    if (!m_watchedFolders.contains(kioPath)) return;
+
     m_watchedFolders.removeAll(kioPath);
+    emit watchedFoldersChanged();
 
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("DELETE FROM watched_folders WHERE path = ?"));
     q.addBindValue(kioPath);
     q.exec();
 
-    QString trimmed = kioPath;
-    if (trimmed.endsWith(QLatin1Char('/'))) trimmed.chop(1);
-    const QString folderName = QUrl(trimmed).fileName();
-    QSqlQuery q2(m_db);
-    q2.prepare(QStringLiteral("DELETE FROM photos WHERE folder = ?"));
-    q2.addBindValue(folderName);
-    q2.exec();
+    q.prepare(QStringLiteral("DELETE FROM photos WHERE folder = ?"));
+    q.addBindValue(kioPath);
+    q.exec();
 
-    emit watchedFoldersChanged();
     loadFromDb();
 }
 
-// ── Scan ──────────────────────────────────────
+// ── Scanning ──────────────────────────────────
 
 void GalleryModel::scan()
 {
-    if (m_scanning || m_watchedFolders.isEmpty()) return;
-
+    if (m_scanning) return;
     m_scanning = true;
+    m_abort.store(false);
     emit scanningChanged();
 
-    // Capture by value so the lambda owns everything it needs
-    QStringList folders = m_watchedFolders;
-    QString dbPathCopy  = dbPath();
+    // Reset failed thumbnails on rescan
+    m_failedThumbIds.clear();
+    QSqlQuery resetFailed(m_db);
+    resetFailed.exec(QStringLiteral("UPDATE photos SET thumb_failed = 0"));
 
-    auto future = QtConcurrent::run([folders, dbPathCopy, this]() {
-        // Each concurrent scan needs its own uniquely-named db connection.
-        // QThread::currentThread()->objectName() is empty for threads pulled
-        // from QtConcurrent's global thread pool, so two scans (or two scans
-        // that happen to land on the same pooled thread) would collide on
-        // the same connection name and one QSqlDatabase::addDatabase() call
-        // would silently replace the other's connection. Use a process-wide
-        // atomic counter instead, which is unique per scan() invocation
-        // regardless of which thread actually executes it.
+    const QStringList folders = m_watchedFolders;
+    const QString dbPathCopy = dbPath();
+    const QString thumbDir = thumbCacheDir();
+
+    auto future = QtConcurrent::run([folders, dbPathCopy, thumbDir, this]() {
         static QAtomicInteger<quint64> s_scanConnectionCounter{0};
         const QString connectionName =
             QStringLiteral("kamera_scan_%1").arg(s_scanConnectionCounter.fetchAndAddOrdered(1));
 
-        QSqlDatabase db = QSqlDatabase::addDatabase(
-            QStringLiteral("QSQLITE"), connectionName);
-        db.setDatabaseName(dbPathCopy);
-        if (!db.open()) {
-            qWarning() << "Scan thread cannot open DB";
-            return;
-        }
-
-        for (const QString &folderPath : folders) {
-            if (m_abort.load()) break;
-            QUrl folderUrl(folderPath);
-
-            // KIO::listJob must run on the main thread (event loop required).
-            // We schedule it there and block until it finishes.
-            QList<KFileItem> items;
-            QEventLoop loop;
-
-            QMetaObject::invokeMethod(qApp, [&]() {
-                auto *job = KIO::listDir(folderUrl, KIO::HideProgressInfo);
-                QObject::connect(job, &KIO::ListJob::entries,
-                                 [&items, folderUrl](KIO::Job *, const KIO::UDSEntryList &list) {
-                    for (const auto &entry : list) {
-                        KFileItem item(entry, folderUrl, false, true);
-                        if (!item.isDir())
-                            items << item;
-                    }
-                });
-                QObject::connect(job, &KJob::finished, &loop, &QEventLoop::quit);
-                job->start();
-            }, Qt::BlockingQueuedConnection);
-
-            loop.exec();
-            if (m_abort.load()) break;
-
-            QSqlQuery ins(db);
-            ins.prepare(QStringLiteral(R"sql(
-                INSERT OR IGNORE INTO photos
-                    (id, url, filename, date_taken, folder, file_size, is_video, local_thumb)
-                VALUES (?, ?, ?, ?, ?, ?, ?, '')
-            )sql"));
-
-            // Folder display/filter name must exactly match what
-            // Sidebar.qml derives from the same watched-folder path (it
-            // strips a trailing slash, then takes the last '/'-segment).
-            // QUrl::fileName() alone returns "" when the path ends in '/',
-            // which would silently break folder-mode filtering for any
-            // folder chosen with a trailing slash (KUrlRequesterDialog can
-            // produce these). Strip it first so both sides agree.
-            QString trimmedFolderPath = folderPath;
-            if (trimmedFolderPath.endsWith(QLatin1Char('/')))
-                trimmedFolderPath.chop(1);
-            const QString folderName = QUrl(trimmedFolderPath).fileName();
-
-            for (const KFileItem &item : std::as_const(items)) {
-                if (m_abort.load()) break;
-                if (!isMediaFile(item.name())) continue;
-
-                const QUrl url = item.url();
-                const QString id = photoId(url);
-
-                // Check if already in DB
-                QSqlQuery chk(db);
-                chk.prepare(QStringLiteral("SELECT id FROM photos WHERE id = ?"));
-                chk.addBindValue(id);
-                chk.exec();
-                if (chk.next()) continue; // already indexed
-
-                QDateTime dt = item.time(KFileItem::ModificationTime);
-
-                ins.addBindValue(id);
-                ins.addBindValue(url.toString());
-                ins.addBindValue(item.name());
-                ins.addBindValue(dt.toString(Qt::ISODate));
-                ins.addBindValue(folderName);
-                ins.addBindValue(item.size());
-                ins.addBindValue(isVideoFile(item.name()) ? 1 : 0);
-                ins.exec();
+        {
+            QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+            db.setDatabaseName(dbPathCopy);
+            if (!db.open()) {
+                qWarning() << "Scan thread cannot open DB";
+                return;
             }
-        }
 
-        db.close();
-        QSqlDatabase::removeDatabase(db.connectionName());
+            for (const QString &folderPath : folders) {
+                if (m_abort.load()) break;
+                QUrl folderUrl(folderPath);
+
+                QList<KFileItem> items;
+                bool listError = false;
+                QString errorText;
+                QEventLoop loop;
+
+                QMetaObject::invokeMethod(qApp, [&]() {
+                    auto *job = KIO::listDir(folderUrl, KIO::HideProgressInfo);
+                    QObject::connect(job, &KIO::ListJob::entries,
+                                     [&items, folderUrl](KIO::Job *, const KIO::UDSEntryList &list) {
+                        for (const auto &entry : list) {
+                            KFileItem item(entry, folderUrl, false, true);
+                            if (!item.isDir())
+                                items << item;
+                        }
+                    });
+                    QObject::connect(job, &KJob::finished, &loop, [&listError, &errorText, &loop](KJob *j) {
+                        if (j->error()) {
+                            listError = true;
+                            errorText = j->errorString();
+                        }
+                        loop.quit();
+                    }, Qt::QueuedConnection);
+
+                    job->start();
+                }, Qt::QueuedConnection);
+
+                loop.exec();
+                if (m_abort.load()) break;
+
+                if (listError) {
+                    QMetaObject::invokeMethod(this, [this, errorText]() {
+                        emit error(errorText);
+                    });
+                    continue;
+                }
+
+                // Collect found URLs for pruning removed items
+                QSet<QString> foundUrls;
+                for (const KFileItem &item : std::as_const(items)) {
+                    if (isMediaFile(item.name())) {
+                        foundUrls.insert(item.url().toString());
+                    }
+                }
+
+                db.transaction();
+
+                // 1. Prune DB entries that were deleted on the source
+                QSqlQuery delCheck(db);
+                delCheck.prepare(QStringLiteral("SELECT id, url, local_thumb FROM photos WHERE folder = ?"));
+                delCheck.addBindValue(folderPath);
+                if (delCheck.exec()) {
+                    while (delCheck.next()) {
+                        const QString url = delCheck.value(1).toString();
+                        if (!foundUrls.contains(url)) {
+                            const QString id = delCheck.value(0).toString();
+                            const QString thumb = delCheck.value(2).toString();
+                            if (!thumb.isEmpty() && QFile::exists(thumb)) {
+                                QFile::remove(thumb);
+                            }
+                            QSqlQuery prune(db);
+                            prune.prepare(QStringLiteral("DELETE FROM photos WHERE id = ?"));
+                            prune.addBindValue(id);
+                            prune.exec();
+                        }
+                    }
+                }
+
+                // 2. Batch insert/update newly found or modified items
+                QSqlQuery ins(db);
+                ins.prepare(QStringLiteral(R"sql(
+                    INSERT INTO photos
+                        (id, url, filename, date_taken, folder, file_size, is_video, local_thumb, thumb_failed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, '', 0)
+                    ON CONFLICT(url) DO UPDATE SET
+                        filename = excluded.filename,
+                        date_taken = excluded.date_taken,
+                        folder = excluded.folder,
+                        file_size = excluded.file_size,
+                        is_video = excluded.is_video
+                )sql"));
+
+                for (const KFileItem &item : std::as_const(items)) {
+                    if (m_abort.load()) break;
+                    if (!isMediaFile(item.name())) continue;
+
+                    const QUrl url = item.url();
+                    const QString id = photoId(url);
+                    QDateTime dt = item.time(KFileItem::ModificationTime);
+
+                    ins.addBindValue(id);
+                    ins.addBindValue(url.toString());
+                    ins.addBindValue(item.name());
+                    ins.addBindValue(dt.toString(Qt::ISODate));
+                    ins.addBindValue(folderPath);
+                    ins.addBindValue(item.size());
+                    ins.addBindValue(VideoUtils::isVideoFile(item.name()) ? 1 : 0);
+                    ins.exec();
+                }
+
+                db.commit();
+            }
+
+            db.close();
+        }
+        QSqlDatabase::removeDatabase(connectionName);
     });
 
     m_scanWatcher->setFuture(future);
@@ -443,11 +504,12 @@ void GalleryModel::generateThumbs()
 {
     if (m_generatingThumbs) return;
 
-    // Collect entries that need a thumb (both images and videos)
+    // Collect entries that need a thumb and haven't failed
     QList<PhotoEntry> todo;
     for (const PhotoEntry &e : std::as_const(m_all)) {
-        if (e.localThumb.isEmpty() || !QFile::exists(e.localThumb))
+        if (!e.hasThumb && !e.thumbFailed && !m_failedThumbIds.contains(e.id)) {
             todo << e;
+        }
     }
     if (todo.isEmpty()) return;
 
@@ -462,82 +524,93 @@ void GalleryModel::generateThumbs()
         const QString connectionName =
             QStringLiteral("kamera_thumb_%1").arg(s_thumbConnectionCounter.fetchAndAddOrdered(1));
 
-        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
-        db.setDatabaseName(dbPathCopy);
-        if (!db.open()) {
-            qWarning() << "Thumbnail thread cannot open DB";
-            return;
-        }
+        {
+            QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+            db.setDatabaseName(dbPathCopy);
+            if (!db.open()) {
+                qWarning() << "Thumbnail thread cannot open DB";
+                return;
+            }
 
-        for (const PhotoEntry &entry : todo) {
-            if (m_abort.load()) break;
-            const QString thumbPath = cacheDir + QStringLiteral("/") + entry.id + QStringLiteral(".jpg");
-            bool thumbSaved = false;
-
-            if (QFile::exists(thumbPath)) {
-                thumbSaved = true;
-            } else if (entry.url.isLocalFile()) {
-                QString localPath = entry.url.toLocalFile();
-                QImage img;
-                if (entry.isVideo) {
-                    img = VideoUtils::extractFirstFrame(localPath);
-                } else {
-                    QImageReader reader(localPath);
-                    reader.setAutoTransform(true);
-                    img = reader.read();
-                }
-                if (!img.isNull()) {
-                    if (img.width() > 1024 || img.height() > 1024)
-                        img = img.scaled(QSize(1024, 1024), Qt::KeepAspectRatio, Qt::SmoothTransformation);
-                    thumbSaved = img.save(thumbPath, "JPEG", 85);
-                }
-            } else {
-                // Remote file: fetch data via KIO on the main thread event loop
-                QByteArray data;
-                QEventLoop loop;
-
-                QMetaObject::invokeMethod(qApp, [&]() {
-                    auto *job = KIO::storedGet(entry.url, KIO::NoReload, KIO::HideProgressInfo);
-                    QObject::connect(job, &KIO::StoredTransferJob::result, [&](KJob *j) {
-                        if (!j->error())
-                            data = static_cast<KIO::StoredTransferJob *>(j)->data();
-                        loop.quit();
-                    });
-                    job->start();
-                }, Qt::BlockingQueuedConnection);
-
-                loop.exec();
+            for (const PhotoEntry &entry : todo) {
                 if (m_abort.load()) break;
+                const QString thumbPath = cacheDir + QStringLiteral("/") + entry.id + QStringLiteral(".jpg");
+                bool thumbSaved = false;
 
-                if (!data.isEmpty()) {
+                if (QFile::exists(thumbPath)) {
+                    thumbSaved = true;
+                } else if (entry.url.isLocalFile()) {
+                    QString localPath = entry.url.toLocalFile();
                     QImage img;
                     if (entry.isVideo) {
-                        img = VideoUtils::extractFirstFrameFromData(data);
+                        img = VideoUtils::extractFirstFrame(localPath);
+                        if (img.isNull()) {
+                            img = VideoUtils::generateVideoPlaceholder(320, 320);
+                        }
                     } else {
-                        img.loadFromData(data);
+                        QImageReader reader(localPath);
+                        reader.setAutoTransform(true);
+                        img = reader.read();
                     }
+
                     if (!img.isNull()) {
-                        if (img.width() > 1024 || img.height() > 1024)
-                            img = img.scaled(QSize(1024, 1024), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+                        if (img.width() > 320 || img.height() > 320)
+                            img = img.scaled(QSize(320, 320), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+                        thumbSaved = img.save(thumbPath, "JPEG", 85);
+                    }
+                } else {
+                    // Remote file
+                    bool ok = false;
+                    QByteArray data = KioHelper::fetchViaKio(entry.url, 12000, &ok);
+                    if (m_abort.load()) break;
+
+                    QImage img;
+                    if (!data.isEmpty()) {
+                        if (entry.isVideo) {
+                            img = VideoUtils::extractFirstFrameFromData(data);
+                        } else {
+                            img = KioHelper::decodeImageWithAutoTransform(data);
+                        }
+                    }
+
+                    // If remote video frame extraction couldn't parse the stream (e.g. moov atom at end),
+                    // use clean video placeholder so thumbnail generation completes without hanging
+                    if (img.isNull() && entry.isVideo) {
+                        img = VideoUtils::generateVideoPlaceholder(320, 320);
+                    }
+
+                    if (!img.isNull()) {
+                        if (img.width() > 320 || img.height() > 320)
+                            img = img.scaled(QSize(320, 320), Qt::KeepAspectRatio, Qt::SmoothTransformation);
                         thumbSaved = img.save(thumbPath, "JPEG", 85);
                     }
                 }
+
+                if (thumbSaved) {
+                    QSqlQuery q(db);
+                    q.prepare(QStringLiteral("UPDATE photos SET local_thumb = ?, thumb_failed = 0 WHERE id = ?"));
+                    q.addBindValue(thumbPath);
+                    q.addBindValue(entry.id);
+                    q.exec();
+
+                    QMetaObject::invokeMethod(this, [this, id = entry.id]() {
+                        emit thumbReady(id);
+                    });
+                } else {
+                    // Record failure to prevent endless looping
+                    QSqlQuery q(db);
+                    q.prepare(QStringLiteral("UPDATE photos SET thumb_failed = 1 WHERE id = ?"));
+                    q.addBindValue(entry.id);
+                    q.exec();
+
+                    QMetaObject::invokeMethod(this, [this, id = entry.id]() {
+                        m_failedThumbIds.insert(id);
+                    });
+                }
             }
 
-            if (thumbSaved) {
-                QSqlQuery q(db);
-                q.prepare(QStringLiteral("UPDATE photos SET local_thumb = ? WHERE id = ?"));
-                q.addBindValue(thumbPath);
-                q.addBindValue(entry.id);
-                q.exec();
-
-                QMetaObject::invokeMethod(this, [this, id = entry.id]() {
-                    emit thumbReady(id);
-                });
-            }
+            db.close();
         }
-
-        db.close();
         QSqlDatabase::removeDatabase(connectionName);
     });
 
@@ -561,12 +634,23 @@ void GalleryModel::openFullRes(int idx)
 void GalleryModel::copyToPC(int idx, const QString &destPath)
 {
     if (idx < 0 || idx >= m_filtered.size()) return;
-    const PhotoEntry &e = m_filtered.at(idx);
+    const PhotoEntry e = m_filtered.at(idx);
 
     QUrl dest = QUrl::fromLocalFile(destPath + QStringLiteral("/") + e.filename);
     auto *job = KIO::copy(e.url, dest, KIO::DefaultFlags);
     job->setUiDelegate(KIO::createDefaultJobUiDelegate(
         KJobUiDelegate::AutoHandlingEnabled, nullptr));
+
+    connect(job, &KJob::result, this, [this, e, destPath](KJob *j) {
+        if (j->error()) {
+            emit error(j->errorString());
+        } else {
+            const QString msg = tr("Copied %1 to %2").arg(e.filename, destPath);
+            emit notification(msg);
+            KNotification::event(QStringLiteral("notification"), msg);
+        }
+    });
+
     job->start();
 }
 
@@ -575,17 +659,27 @@ void GalleryModel::deleteFromPhone(int idx)
     if (idx < 0 || idx >= m_filtered.size()) return;
     const PhotoEntry e = m_filtered.at(idx);
 
-    auto *job = KIO::del(e.url, KIO::DefaultFlags);
+    // For local files, use trash if available; for remote devices, del
+    KJob *job = e.url.isLocalFile() ? static_cast<KJob *>(KIO::trash(e.url)) : static_cast<KJob *>(KIO::del(e.url));
+
     connect(job, &KJob::finished, this, [this, e](KJob *j) {
         if (j->error()) {
             emit error(j->errorString());
             return;
         }
+
+        // Remove cached thumb
+        if (!e.localThumb.isEmpty() && QFile::exists(e.localThumb)) {
+            QFile::remove(e.localThumb);
+        }
+
         // Remove from DB
         QSqlQuery q(m_db);
         q.prepare(QStringLiteral("DELETE FROM photos WHERE id = ?"));
         q.addBindValue(e.id);
         q.exec();
+
+        emit notification(tr("Deleted %1").arg(e.filename));
         loadFromDb();
     });
     job->start();
@@ -596,22 +690,39 @@ void GalleryModel::renameFile(int idx, const QString &newName)
     if (idx < 0 || idx >= m_filtered.size()) return;
     const PhotoEntry e = m_filtered.at(idx);
 
+    if (newName.trimmed().isEmpty() || newName == e.filename || newName.contains(QLatin1Char('/'))) {
+        return;
+    }
+
     QUrl dest = e.url.adjusted(QUrl::RemoveFilename);
     dest.setPath(dest.path() + newName);
 
+    const QString newId = photoId(dest);
+
     auto *job = KIO::rename(e.url, dest, KIO::DefaultFlags);
-    connect(job, &KJob::finished, this, [this, e, newName, dest](KJob *j) {
+    connect(job, &KJob::finished, this, [this, e, newName, dest, newId](KJob *j) {
         if (j->error()) {
             emit error(j->errorString());
             return;
         }
+
+        QString newThumbPath = e.localThumb;
+        if (!e.localThumb.isEmpty() && QFile::exists(e.localThumb)) {
+            newThumbPath = thumbCacheDir() + QStringLiteral("/") + newId + QStringLiteral(".jpg");
+            QFile::rename(e.localThumb, newThumbPath);
+        }
+
         QSqlQuery q(m_db);
         q.prepare(QStringLiteral(
-            "UPDATE photos SET filename = ?, url = ? WHERE id = ?"));
+            "UPDATE photos SET id = ?, filename = ?, url = ?, local_thumb = ? WHERE id = ?"));
+        q.addBindValue(newId);
         q.addBindValue(newName);
         q.addBindValue(dest.toString());
+        q.addBindValue(newThumbPath);
         q.addBindValue(e.id);
         q.exec();
+
+        emit notification(tr("Renamed %1 to %2").arg(e.filename, newName));
         loadFromDb();
     });
     job->start();
@@ -638,6 +749,22 @@ QVariantMap GalleryModel::exifForIndex(int idx) const
     return map;
 }
 
+int GalleryModel::indexOfId(const QString &id) const
+{
+    if (id.isEmpty()) return -1;
+    for (int i = 0; i < m_filtered.size(); ++i) {
+        if (m_filtered.at(i).id == id)
+            return i;
+    }
+    return -1;
+}
+
+QString GalleryModel::idForIndex(int index) const
+{
+    if (index < 0 || index >= m_filtered.size()) return {};
+    return m_filtered.at(index).id;
+}
+
 int GalleryModel::nextIndex(int current) const
 {
     if (m_filtered.isEmpty()) return -1;
@@ -654,6 +781,12 @@ void GalleryModel::preloadNeighbors(int current, int distance)
 {
     if (current < 0 || m_filtered.isEmpty() || distance <= 0) return;
 
+    // Cancel any previous preload to prioritize current view
+    m_preloadAbort.store(true);
+    if (m_preloadWatcher && m_preloadWatcher->isRunning()) {
+        m_preloadWatcher->cancel();
+    }
+
     struct PreloadTarget {
         QUrl url;
         bool isVideo;
@@ -661,68 +794,58 @@ void GalleryModel::preloadNeighbors(int current, int distance)
     QList<PreloadTarget> targets;
     const int total = m_filtered.size();
 
-    // Preload next and prev `distance` neighbors (e.g. 4 ahead, 4 behind)
     for (int step = 1; step <= distance; ++step) {
         int nextIdx = (current + step) % total;
         int prevIdx = (current - step + total) % total;
 
         if (nextIdx >= 0 && nextIdx < total) {
-            targets.append({m_filtered.at(nextIdx).url, m_filtered.at(nextIdx).isVideo});
+            const PhotoEntry &e = m_filtered.at(nextIdx);
+            // Skip local files (they load directly and do not need disk cache)
+            if (!e.url.isLocalFile()) {
+                targets.append({e.url, e.isVideo});
+            }
         }
         if (prevIdx >= 0 && prevIdx < total && prevIdx != nextIdx) {
-            targets.append({m_filtered.at(prevIdx).url, m_filtered.at(prevIdx).isVideo});
+            const PhotoEntry &e = m_filtered.at(prevIdx);
+            if (!e.url.isLocalFile()) {
+                targets.append({e.url, e.isVideo});
+            }
         }
     }
 
     if (targets.isEmpty()) return;
 
-    QtConcurrent::run([targets, this]() {
+    m_preloadAbort.store(false);
+
+    auto future = QtConcurrent::run([targets, this]() {
         for (const auto &target : targets) {
-            if (m_abort.load()) break;
+            if (m_preloadAbort.load() || m_abort.load()) break;
             const QString urlStr = target.url.toString();
             if (ImageDiskCache::contains(urlStr)) continue;
 
+            bool ok = false;
+            QByteArray data = KioHelper::fetchViaKio(target.url, 15000, &ok);
+            if (m_preloadAbort.load() || m_abort.load()) break;
+
             QImage img;
-            if (target.url.isLocalFile() || !urlStr.contains(QStringLiteral("://"))) {
-                QString localPath = target.url.isLocalFile() ? target.url.toLocalFile() : urlStr;
+            if (!data.isEmpty()) {
                 if (target.isVideo) {
-                    img = VideoUtils::extractFirstFrame(localPath);
-                } else {
-                    QImageReader reader(localPath);
-                    reader.setAutoTransform(true);
-                    img = reader.read();
-                }
-            } else {
-                // Remote file
-                QByteArray data;
-                QEventLoop loop;
-                QMetaObject::invokeMethod(qApp, [&]() {
-                    auto *job = KIO::storedGet(target.url, KIO::NoReload, KIO::HideProgressInfo);
-                    QObject::connect(job, &KIO::StoredTransferJob::result, [&](KJob *j) {
-                        if (!j->error())
-                            data = static_cast<KIO::StoredTransferJob *>(j)->data();
-                        loop.quit();
-                    });
-                    job->start();
-                }, Qt::QueuedConnection);
-
-                loop.exec();
-                if (m_abort.load()) break;
-
-                if (!data.isEmpty()) {
-                    if (target.isVideo) {
-                        img = VideoUtils::extractFirstFrameFromData(data);
-                    } else {
-                        img.loadFromData(data);
+                    img = VideoUtils::extractFirstFrameFromData(data);
+                    if (img.isNull()) {
+                        img = VideoUtils::generateVideoPlaceholder(640, 640);
                     }
+                } else {
+                    img = KioHelper::decodeImageWithAutoTransform(data);
                 }
             }
 
-            if (!img.isNull()) {
+            if (!img.isNull() && !m_preloadAbort.load()) {
                 ImageDiskCache::put(urlStr, img, 20);
             }
         }
     });
+
+    m_preloadWatcher->setFuture(future);
 }
 
 // ── Grouping ──────────────────────────────────

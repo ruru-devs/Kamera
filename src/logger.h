@@ -9,7 +9,8 @@ namespace Logger
     // - Configures log location (~/.local/share/kamera/kamera.log)
     // - Enforces a 5MB size limit and 30-day retention policy (pruning expired entries)
     // - Installs the Qt message handler to capture all qDebug/qInfo/qWarning/qCritical/qFatal output
-    void init();
+    // - If verbose is true or KAMERA_VERBOSE is set, echoes logs to stderr as well
+    void init(bool verbose = false);
 
     // Returns the absolute file path to the current log file
     QString logFilePath();

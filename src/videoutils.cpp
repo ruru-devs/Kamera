@@ -3,6 +3,9 @@
 #include <QProcess>
 #include <QFileInfo>
 #include <QStringList>
+#include <QPainter>
+#include <QPolygon>
+#include <QPoint>
 
 namespace VideoUtils
 {
@@ -22,6 +25,8 @@ namespace VideoUtils
     {
         QProcess proc;
         QStringList args = {
+            QStringLiteral("-nostdin"),
+            QStringLiteral("-protocol_whitelist"), QStringLiteral("file,pipe"),
             QStringLiteral("-v"), QStringLiteral("error"),
             QStringLiteral("-ss"), QStringLiteral("00:00:00"),
             QStringLiteral("-i"), localPath,
@@ -48,6 +53,8 @@ namespace VideoUtils
 
         QProcess proc;
         QStringList args = {
+            QStringLiteral("-nostdin"),
+            QStringLiteral("-protocol_whitelist"), QStringLiteral("file,pipe"),
             QStringLiteral("-v"), QStringLiteral("error"),
             QStringLiteral("-ss"), QStringLiteral("00:00:00"),
             QStringLiteral("-i"), QStringLiteral("pipe:0"),
@@ -71,5 +78,35 @@ namespace VideoUtils
         QImage img;
         img.loadFromData(data, "JPEG");
         return img;
+    }
+
+    QImage generateVideoPlaceholder(int width, int height)
+    {
+        QImage placeholder(width, height, QImage::Format_ARGB32_Premultiplied);
+        placeholder.fill(QColor(24, 24, 37)); // Catppuccin mantle-like dark tone
+
+        QPainter painter(&placeholder);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+
+        // Draw central filmstrip / play badge graphic
+        const int circleRadius = qMin(width, height) / 4;
+        const QPoint center(width / 2, height / 2);
+
+        painter.setBrush(QColor(49, 50, 68, 200));
+        painter.setPen(QPen(QColor(180, 190, 254), 2));
+        painter.drawEllipse(center, circleRadius, circleRadius);
+
+        // Draw play triangle
+        const int triSize = circleRadius * 0.7;
+        QPolygon triangle;
+        triangle << QPoint(center.x() - triSize * 0.4, center.y() - triSize * 0.6)
+                 << QPoint(center.x() + triSize * 0.7, center.y())
+                 << QPoint(center.x() - triSize * 0.4, center.y() + triSize * 0.6);
+
+        painter.setBrush(QColor(245, 245, 245));
+        painter.setPen(Qt::NoPen);
+        painter.drawPolygon(triangle);
+
+        return placeholder;
     }
 }

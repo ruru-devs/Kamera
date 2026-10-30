@@ -5,17 +5,21 @@ import kamera 1.0
 
 // The hero of the app. Edge-to-edge thumbnail grid. In "date" mode, a thin
 // sticky strip at the top shows the date label for whatever's currently
-// scrolled into view — GridView lays out uniform cells, so a real
-// Google-Photos-style row-breaking header isn't something it can do
-// natively; this gets the orientation benefit without that complexity.
+// scrolled into view.
 Item {
     id: root
     property var model
     signal photoActivated(int index)
 
-    readonly property int cellSize: 152
-    readonly property int cellSpacing: 3
+    readonly property int desiredCellSize: 156
+    readonly property int cellSpacing: 4
     readonly property int stripHeight: 34
+
+    // Dynamic responsive grid: stretch cells evenly across available width
+    readonly property int availableWidth: Math.max(100, width - 24)
+    readonly property int columns: Math.max(1, Math.floor((availableWidth + cellSpacing) / (desiredCellSize + cellSpacing)))
+    readonly property int actualCellWidth: Math.floor((availableWidth - (columns - 1) * cellSpacing) / columns)
+    readonly property int actualCellHeight: actualCellWidth
 
     Rectangle {
         anchors.fill: parent
@@ -34,8 +38,6 @@ Item {
         color: Theme.bg
 
         Rectangle {
-            // hairline under the strip so it reads as a fixed band, not
-            // part of the scrolling content
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: parent.bottom
@@ -69,10 +71,10 @@ Item {
         anchors.margins: 12
         anchors.topMargin: 12
         clip: true
-        cellWidth: root.cellSize + root.cellSpacing
-        cellHeight: root.cellSize + root.cellSpacing
+        cellWidth: root.actualCellWidth + root.cellSpacing
+        cellHeight: root.actualCellHeight + root.cellSpacing
         model: root.model
-        cacheBuffer: cellHeight * 6 // prefetch a few rows ahead of scroll
+        cacheBuffer: cellHeight * 4
 
         WheelHandler {
             target: null
@@ -90,8 +92,8 @@ Item {
 
         delegate: Item {
             id: cell
-            width: grid.cellWidth - root.cellSpacing
-            height: grid.cellHeight - root.cellSpacing
+            width: root.actualCellWidth
+            height: root.actualCellHeight
 
             Rectangle {
                 id: thumb
@@ -108,9 +110,10 @@ Item {
                     source: model.hasThumb
                         ? "image://thumb/" + encodeURIComponent(model.localThumb)
                         : ""
+                    sourceSize: Qt.size(root.actualCellWidth * 2, root.actualCellHeight * 2)
                     fillMode: Image.PreserveAspectCrop
                     asynchronous: true
-                    cache: false
+                    cache: true
                 }
 
                 // Placeholder while the background thumb generator catches up.
@@ -148,7 +151,7 @@ Item {
                     }
                 }
 
-                // Subtle hover lift — the only chrome the grid gets.
+                // Subtle hover lift
                 scale: thumb.hovered ? 1.03 : 1.0
                 Behavior on scale { NumberAnimation { duration: Theme.durationFast } }
 

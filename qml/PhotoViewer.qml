@@ -3,64 +3,90 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import kamera 1.0
 
-// Full-res viewer. Streams the original from the phone via KIO (handled by
-// FileOps/openWith for video, and a plain Image with the KIO url for
-// photos — KIO registers its own Qt network/file backends so QML's Image
-// can load a phone:// url directly once KIO has mounted it).
-// Arrow-key navigation only — no slideshow, no in-app editing; this is a
-// viewer, not an editor.
+// Full-res viewer with zoom/pan, navigation, caching, and management
 Item {
     id: root
     property var model
     property int currentIndex: -1
+    property string currentPhotoId: ""
+
+    // Zoom and pan properties
+    property real zoomScale: 1.0
+    readonly property real minZoom: 1.0
+    readonly property real maxZoom: 5.0
+
+    function resetZoom() {
+        zoomScale = 1.0
+        contentItem.x = 0
+        contentItem.y = 0
+    }
 
     function openAt(index) {
+        if (!root.model || index < 0 || index >= root.model.count) return
         currentIndex = index
+        currentPhotoId = root.model.idForIndex(index)
+        resetZoom()
         visible = true
         forceActiveFocus()
         exifPanel.visible = false
-        if (root.model && index >= 0) {
-            root.model.preloadNeighbors(index, 4)
-        }
+        root.model.preloadNeighbors(index, 4)
     }
 
     function close() {
         visible = false
         currentIndex = -1
+        currentPhotoId = ""
+        resetZoom()
     }
 
     function goNext() {
-        if (currentIndex < 0) return
+        if (currentIndex < 0 || !root.model || root.model.count === 0) return
         currentIndex = root.model.nextIndex(currentIndex)
-        if (root.model && currentIndex >= 0) {
-            root.model.preloadNeighbors(currentIndex, 4)
-        }
+        currentPhotoId = root.model.idForIndex(currentIndex)
+        resetZoom()
+        root.model.preloadNeighbors(currentIndex, 4)
     }
 
     function goPrev() {
-        if (currentIndex < 0) return
+        if (currentIndex < 0 || !root.model || root.model.count === 0) return
         currentIndex = root.model.prevIndex(currentIndex)
-        if (root.model && currentIndex >= 0) {
-            root.model.preloadNeighbors(currentIndex, 4)
+        currentPhotoId = root.model.idForIndex(currentIndex)
+        resetZoom()
+        root.model.preloadNeighbors(currentIndex, 4)
+    }
+
+    // Keep viewer on the selected photo across model resets
+    Connections {
+        target: root.model
+        function onModelReset() {
+            if (!root.visible || root.currentPhotoId === "") return
+            var newIdx = root.model.indexOfId(root.currentPhotoId)
+            if (newIdx >= 0) {
+                root.currentIndex = newIdx
+            } else if (root.model.count > 0) {
+                var fallbackIdx = Math.min(root.currentIndex, root.model.count - 1)
+                if (fallbackIdx < 0) fallbackIdx = 0
+                root.currentIndex = fallbackIdx
+                root.currentPhotoId = root.model.idForIndex(fallbackIdx)
+            } else {
+                root.close()
+            }
         }
     }
 
-    // Single source of truth for "is the current item a video", derived
-    // from currentEntry. Previously this was declared twice as a local
-    // property — once on fullImage, once on the sibling Column — which
-    // happened to work for those two bindings individually but is fragile
-    // and wrong in spirit: `isVideoCurrent` referenced from any other
-    // sibling (or from a binding inside this Item but outside fullImage)
-    // resolved to undefined/error since neither local copy is visible
-    // outside its own object. Hoisting it onto root makes it a real,
-    // single, reusable property.
     readonly property bool isVideoCurrent: root.currentEntry ? root.currentEntry.isVideo : false
     readonly property bool isLocalCurrent: root.currentEntry ? (String(root.currentEntry.url).indexOf("file:") === 0 || String(root.currentEntry.url).indexOf("://") === -1) : false
 
     focus: visible
     Keys.onLeftPressed: goPrev()
     Keys.onRightPressed: goNext()
-    Keys.onEscapePressed: close()
+    Keys.onEscapePressed: {
+        if (zoomScale > 1.05) {
+            resetZoom()
+        } else {
+            close()
+        }
+    }
     Keys.onReturnPressed: if (currentIndex >= 0) root.model.openFullRes(currentIndex)
     Keys.onEnterPressed: if (currentIndex >= 0) root.model.openFullRes(currentIndex)
 
@@ -74,79 +100,110 @@ Item {
         id: stage
         anchors.fill: parent
         anchors.bottomMargin: bottomBar.height
+        clip: true
 
-        // Cached thumbnail preview shown while full-res loads or as fallback
-        Image {
-            id: thumbPreview
+        Item {
+            id: contentItem
             anchors.fill: parent
-            anchors.margins: 24
-            fillMode: Image.PreserveAspectFit
-            asynchronous: true
-            visible: root.currentIndex >= 0 && Boolean(root.currentEntry && root.currentEntry.hasThumb) && (fullImage.status !== Image.Ready)
-            source: (root.currentEntry && root.currentEntry.hasThumb && root.currentEntry.localThumb)
-                ? "image://thumb/" + encodeURIComponent(root.currentEntry.localThumb)
-                : ""
-        }
+            scale: root.zoomScale
+            transformOrigin: Item.Center
 
-        // Full rendered quality image/first frame.
-        // For local files: loaded directly if image, or via image://full/ for video first frame.
-        // For remote files: loaded via the async KIO image://full/ provider.
-        Image {
-            id: fullImage
-            anchors.fill: parent
-            anchors.margins: 24
-            fillMode: Image.PreserveAspectFit
-            asynchronous: true
-            visible: root.currentIndex >= 0 && (status === Image.Ready)
-            source: {
-                if (root.currentIndex < 0 || !root.currentEntry || !root.currentEntry.url)
-                    return ""
-                if (root.isLocalCurrent && !root.isVideoCurrent)
-                    return root.currentEntry.url
-                return "image://full/" + encodeURIComponent(String(root.currentEntry.url))
+            Behavior on scale { NumberAnimation { duration: Theme.durationFast } }
+
+            // Cached thumbnail preview shown while full-res loads
+            Image {
+                id: thumbPreview
+                anchors.fill: parent
+                anchors.margins: 24
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+                visible: root.currentIndex >= 0 && Boolean(root.currentEntry && root.currentEntry.hasThumb) && (fullImage.status !== Image.Ready)
+                source: (root.currentEntry && root.currentEntry.hasThumb && root.currentEntry.localThumb)
+                    ? "image://thumb/" + encodeURIComponent(root.currentEntry.localThumb)
+                    : ""
+            }
+
+            // Full rendered quality image/first frame
+            Image {
+                id: fullImage
+                anchors.fill: parent
+                anchors.margins: 24
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+                sourceSize: Qt.size(3840, 3840) // Limit max texture size for massive phone sensors
+                visible: root.currentIndex >= 0 && (status === Image.Ready)
+                source: {
+                    if (root.currentIndex < 0 || !root.currentEntry || !root.currentEntry.url)
+                        return ""
+                    if (root.isLocalCurrent && !root.isVideoCurrent)
+                        return root.currentEntry.url
+                    return "image://full/" + encodeURIComponent(String(root.currentEntry.url))
+                }
+            }
+
+            // Video overlay: Large central Play button over the rendered first frame
+            Rectangle {
+                anchors.centerIn: parent
+                visible: root.currentIndex >= 0 && root.isVideoCurrent
+                width: 88
+                height: 88
+                radius: 44
+                color: playArea.containsMouse ? "#DD1E1E2E" : "#AA11111B"
+                border.color: playArea.containsMouse ? Theme.accent : "#FFFFFF55"
+                border.width: 2
+
+                Behavior on color { ColorAnimation { duration: Theme.durationFast } }
+                Behavior on scale { NumberAnimation { duration: Theme.durationFast } }
+                scale: playArea.pressed ? 0.95 : (playArea.containsMouse ? 1.08 : 1.0)
+
+                Text {
+                    anchors.centerIn: parent
+                    anchors.horizontalCenterOffset: 3
+                    text: "▶"
+                    color: "#FFFFFF"
+                    font.pixelSize: 34
+                }
+
+                MouseArea {
+                    id: playArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        if (root.currentEntry) {
+                            fileOps.openWith(root.currentEntry.url)
+                        }
+                    }
+                }
             }
         }
 
+        // Zoom and Pan interaction
         MouseArea {
             anchors.fill: parent
+            hoverEnabled: true
+            drag.target: root.zoomScale > 1.0 ? contentItem : null
+            drag.axis: Drag.XAndYAxis
+
             onDoubleClicked: {
-                if (root.currentIndex >= 0)
-                    root.model.openFullRes(root.currentIndex)
-            }
-        }
-
-        // Video overlay: Large central Play button over the rendered first frame
-        Rectangle {
-            anchors.centerIn: parent
-            visible: root.currentIndex >= 0 && root.isVideoCurrent
-            width: 88
-            height: 88
-            radius: 44
-            color: playArea.containsMouse ? "#DD1E1E2E" : "#AA11111B"
-            border.color: playArea.containsMouse ? Theme.accent : "#FFFFFF55"
-            border.width: 2
-
-            Behavior on color { ColorAnimation { duration: Theme.durationFast } }
-            Behavior on scale { NumberAnimation { duration: Theme.durationFast } }
-            scale: playArea.pressed ? 0.95 : (playArea.containsMouse ? 1.08 : 1.0)
-
-            Text {
-                anchors.centerIn: parent
-                anchors.horizontalCenterOffset: 3 // visual centering for triangle play glyph
-                text: "▶"
-                color: "#FFFFFF"
-                font.pixelSize: 34
-            }
-
-            MouseArea {
-                id: playArea
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                    if (root.currentEntry) {
-                        fileOps.openWith(root.currentEntry.url)
+                if (root.isVideoCurrent) {
+                    if (root.currentIndex >= 0) root.model.openFullRes(root.currentIndex)
+                } else {
+                    if (root.zoomScale > 1.05) {
+                        root.resetZoom()
+                    } else {
+                        root.zoomScale = 2.5
                     }
+                }
+            }
+
+            onWheel: (wheel) => {
+                if (root.isVideoCurrent) return
+                var factor = wheel.angleDelta.y > 0 ? 1.25 : 0.8
+                var targetZoom = Math.max(root.minZoom, Math.min(root.maxZoom, root.zoomScale * factor))
+                root.zoomScale = targetZoom
+                if (root.zoomScale <= 1.05) {
+                    root.resetZoom()
                 }
             }
         }
@@ -158,23 +215,11 @@ Item {
         }
     }
 
-    // Resolve the current row once into a plain object so the rest of the
-    // UI doesn't repeat role lookups everywhere.
-    //
-    // NOTE on the magic numbers below (257/258/262/263/264): these are
-    // Qt::UserRole + 1..N matching GalleryModel::Roles exactly:
-    //   UrlRole = Qt::UserRole + 1        = 257
-    //   FilenameRole                       = 258
-    //   DateTakenRole                      = 259
-    //   DateStringRole                     = 260
-    //   FolderRole                         = 261
-    //   IsVideoRole                        = 262
-    //   LocalThumbRole                     = 263
-    //   HasThumbRole                       = 264
     readonly property var currentEntry: {
         if (currentIndex < 0 || !root.model) return null
         var idx = root.model.index(currentIndex, 0)
         return {
+            id:         root.model.data(idx, 256), // IdRole
             url:        root.model.data(idx, 257), // UrlRole
             filename:   root.model.data(idx, 258), // FilenameRole
             isVideo:    Boolean(root.model.data(idx, 262)), // IsVideoRole
@@ -183,7 +228,7 @@ Item {
         }
     }
 
-    // ── Top bar: filename + close ──
+    // ── Top bar: filename + zoom indicator + close ──
     Rectangle {
         anchors.left: parent.left
         anchors.right: parent.right
@@ -203,6 +248,14 @@ Item {
                 font.family: Theme.fontFamily
                 font.pixelSize: 13
                 elide: Text.ElideMiddle
+            }
+
+            Text {
+                visible: root.zoomScale > 1.05
+                text: Math.round(root.zoomScale * 100) + "%"
+                color: Theme.accent
+                font.family: Theme.fontFamily
+                font.pixelSize: 12
             }
 
             ToolButton {
@@ -348,8 +401,9 @@ Item {
         title: qsTr("Delete from phone?")
         standardButtons: Dialog.Yes | Dialog.No
         onAccepted: {
-            root.model.deleteFromPhone(root.currentIndex)
-            root.close()
+            var deletingIdx = root.currentIndex
+            root.model.deleteFromPhone(deletingIdx)
+            // Model reset handler will advance to the next photo automatically
         }
         Text {
             text: qsTr("This removes the file from your phone. It can't be undone here.")
@@ -365,15 +419,37 @@ Item {
         modal: true
         title: qsTr("Rename file")
         standardButtons: Dialog.Ok | Dialog.Cancel
-        onAccepted: {
-            if (renameField.text.length > 0)
-                root.model.renameFile(root.currentIndex, renameField.text)
-        }
-        onOpened: renameField.text = currentEntry ? currentEntry.filename : ""
 
-        TextField {
-            id: renameField
-            width: 240
+        function performRename() {
+            var newName = renameField.text.trim()
+            if (newName.length > 0 && newName !== currentEntry.filename && newName.indexOf("/") === -1) {
+                root.model.renameFile(root.currentIndex, newName)
+                renameDialog.close()
+            }
+        }
+
+        onAccepted: performRename()
+        onOpened: {
+            renameField.text = currentEntry ? currentEntry.filename : ""
+            renameField.forceActiveFocus()
+            renameField.selectAll()
+        }
+
+        ColumnLayout {
+            spacing: 8
+
+            TextField {
+                id: renameField
+                implicitWidth: 260
+                onAccepted: renameDialog.performRename()
+            }
+
+            Text {
+                visible: renameField.text.indexOf("/") !== -1
+                text: qsTr("Filename cannot contain '/'")
+                color: "#E78284"
+                font.pixelSize: 11
+            }
         }
     }
 }

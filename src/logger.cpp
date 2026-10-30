@@ -16,6 +16,7 @@ namespace Logger
     static QMutex s_logMutex;
     static const qint64 MAX_LOG_SIZE = 5 * 1024 * 1024; // 5 MB
     static const int MAX_RETENTION_DAYS = 30;            // 1 month
+    static bool s_verbose = false;
 
     QString logFilePath()
     {
@@ -129,6 +130,10 @@ namespace Logger
             msg
         );
 
+        if (s_verbose) {
+            std::cerr << logEntry.toStdString();
+        }
+
         const QString activePath = logFilePath();
         QFile file(activePath);
         if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
@@ -141,13 +146,17 @@ namespace Logger
         file.flush();
 
         if (type == QtFatalMsg) {
-            std::cerr << logEntry.toStdString();
+            if (!s_verbose) {
+                std::cerr << logEntry.toStdString();
+            }
             std::abort();
         }
     }
 
-    void init()
+    void init(bool verbose)
     {
+        s_verbose = verbose || qEnvironmentVariableIsSet("KAMERA_VERBOSE");
+
         const QString logPath = logFilePath();
         QDir().mkpath(QFileInfo(logPath).absolutePath());
 

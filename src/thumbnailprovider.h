@@ -4,6 +4,8 @@
 #include <QQuickAsyncImageProvider>
 #include <QQuickTextureFactory>
 #include <QImage>
+#include <memory>
+#include <atomic>
 
 // Serves local cached thumbnail files to QML via
 // image://thumb/<percent-encoded-absolute-path>
@@ -23,9 +25,11 @@ class FullImageResponse : public QQuickImageResponse
 public:
     explicit FullImageResponse(const QString &id, const QSize &requestedSize);
     QQuickTextureFactory *textureFactory() const override;
+    void cancel() override;
 
 private:
     QImage m_image;
+    std::shared_ptr<std::atomic<bool>> m_cancelled;
 };
 
 class FullImageProvider : public QQuickAsyncImageProvider

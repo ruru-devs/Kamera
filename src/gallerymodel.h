@@ -6,16 +6,20 @@
 #include <QStringList>
 #include <QSqlDatabase>
 #include <QFutureWatcher>
+#include <QSet>
+#include <atomic>
 
 struct PhotoEntry {
-    QString id;         // unique: url string
-    QUrl    url;
-    QString filename;
-    QDateTime dateTaken; // from EXIF or file mtime
-    QString folder;      // relative folder name on phone
-    qint64  fileSize;
-    bool    isVideo;
-    QString localThumb;  // path in ~/.cache/kamera/thumbs/
+    QString   id;          // unique: url string md5
+    QUrl      url;
+    QString   filename;
+    QDateTime dateTaken;   // from EXIF or file mtime
+    QString   folder;      // full watched-folder path
+    qint64    fileSize;
+    bool      isVideo;
+    QString   localThumb;  // path in ~/.cache/kamera/thumbs/
+    bool      hasThumb     = false;
+    bool      thumbFailed  = false;
 };
 
 class GalleryModel : public QAbstractListModel
@@ -30,7 +34,8 @@ class GalleryModel : public QAbstractListModel
 
 public:
     enum Roles {
-        UrlRole = Qt::UserRole + 1,
+        IdRole = Qt::UserRole,
+        UrlRole,
         FilenameRole,
         DateTakenRole,
         DateStringRole,
@@ -66,7 +71,11 @@ public:
     Q_INVOKABLE void cancelBackgroundTasks();
     Q_INVOKABLE void preloadNeighbors(int index, int distance = 4);
 
-    // Slideshow
+    // ID / Index helpers for viewer tracking
+    Q_INVOKABLE int indexOfId(const QString &id) const;
+    Q_INVOKABLE QString idForIndex(int index) const;
+
+    // Navigation
     Q_INVOKABLE int nextIndex(int current) const;
     Q_INVOKABLE int prevIndex(int current) const;
 
@@ -87,6 +96,7 @@ signals:
     void thumbReady(const QString &photoId);
     void scanFinished();
     void error(const QString &msg);
+    void notification(const QString &msg);
 
 private:
     void initDb();
@@ -98,6 +108,7 @@ private:
 
     QList<PhotoEntry> m_all;       // all indexed photos
     QList<PhotoEntry> m_filtered;  // currently displayed (view of m_all)
+    QSet<QString>     m_failedThumbIds;
 
     QString      m_viewMode    = QStringLiteral("date");
     QString      m_activeFolder;
@@ -106,7 +117,9 @@ private:
     bool         m_generatingThumbs = false;
 
     QSqlDatabase m_db;
-    QFutureWatcher<void> *m_scanWatcher  = nullptr;
-    QFutureWatcher<void> *m_thumbWatcher = nullptr;
+    QFutureWatcher<void> *m_scanWatcher    = nullptr;
+    QFutureWatcher<void> *m_thumbWatcher   = nullptr;
+    QFutureWatcher<void> *m_preloadWatcher = nullptr;
     std::atomic<bool>     m_abort{false};
+    std::atomic<bool>     m_preloadAbort{false};
 };

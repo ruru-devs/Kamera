@@ -3,10 +3,8 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import kamera 1.0
 
-// Left sidebar: list of watched folders. Selecting one only matters in
-// "By folder" mode — it's what GalleryModel.activeFolder gets set to.
-// Folders are added via a KIO-aware picker (fileOps.chooseWatchedFolder)
-// since they live on the phone, not on the local filesystem.
+// Left sidebar: list of watched folders. Selecting one filters photos in
+// "By folder" mode to that exact watched folder.
 Item {
     id: root
     property var model
@@ -46,16 +44,21 @@ Item {
                 height: 36
 
                 readonly property string folderName: {
-                    // watchedFolders holds full kio paths; show just the
-                    // trailing segment so the list stays scannable.
                     var s = modelData.toString()
                     if (s.endsWith("/")) s = s.slice(0, -1)
                     var parts = s.split("/")
+                    if (parts.length >= 2) {
+                        var parentPart = parts[parts.length - 2]
+                        if (parentPart === "DCIM" || parentPart === "Pictures" || parentPart === "storage" || parentPart === "Download") {
+                            return parentPart + "/" + parts[parts.length - 1]
+                        }
+                    }
                     return parts.length ? parts[parts.length - 1] : s
                 }
+
                 readonly property bool isActive:
                     root.model.viewMode === "folder" &&
-                    root.model.activeFolder === folderName
+                    root.model.activeFolder === modelData
 
                 Rectangle {
                     anchors.fill: parent
@@ -97,7 +100,7 @@ Item {
                     z: -1
                     onClicked: {
                         root.model.viewMode = "folder"
-                        root.model.activeFolder = delegateRoot.folderName
+                        root.model.activeFolder = modelData
                     }
                 }
             }

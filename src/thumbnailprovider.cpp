@@ -1,15 +1,15 @@
 #include "thumbnailprovider.h"
 #include "imagediskcache.h"
 #include "videoutils.h"
+#include "kiohelper.h"
 
 #include <QImage>
 #include <QImageReader>
 #include <QFile>
 #include <QUrl>
-#include <QEventLoop>
+#include <QPointer>
+#include <QThreadPool>
 #include <QCoreApplication>
-#include <QtConcurrent/QtConcurrent>
-#include <KIO/StoredTransferJob>
 
 ThumbnailProvider::ThumbnailProvider()
     : QQuickImageProvider(QQuickImageProvider::Image)
@@ -43,8 +43,14 @@ QImage ThumbnailProvider::requestImage(const QString &id, QSize *size, const QSi
 // ──────────────────────────────────────────────
 
 FullImageResponse::FullImageResponse(const QString &id, const QSize &requestedSize)
+    : m_cancelled(std::make_shared<std::atomic<bool>>(false))
 {
-    QtConcurrent::run([this, id, requestedSize]() {
+    auto cancelled = m_cancelled;
+    QPointer<FullImageResponse> self(this);
+
+    QThreadPool::globalInstance()->start([self, cancelled, id, requestedSize]() {
+        if (cancelled->load()) return;
+
         QString urlStr = QUrl::fromPercentEncoding(id.toUtf8());
         QUrl url(urlStr);
         QImage img;
@@ -53,7 +59,7 @@ FullImageResponse::FullImageResponse(const QString &id, const QSize &requestedSi
         img = ImageDiskCache::get(urlStr);
 
         // 2. If not in cache, load from source
-        if (img.isNull()) {
+        if (img.isNull() && !cancelled->load()) {
             const bool isVideo = VideoUtils::isVideoFile(url.fileName().isEmpty() ? urlStr : url.fileName());
 
             if (url.isLocalFile() || !urlStr.contains(QStringLiteral("://"))) {
@@ -67,43 +73,50 @@ FullImageResponse::FullImageResponse(const QString &id, const QSize &requestedSi
                 }
             } else {
                 // Remote file (e.g. kdeconnect://): fetch data via KIO
-                QByteArray data;
-                QEventLoop loop;
-
-                QMetaObject::invokeMethod(qApp, [&]() {
-                    auto *job = KIO::storedGet(url, KIO::NoReload, KIO::HideProgressInfo);
-                    QObject::connect(job, &KIO::StoredTransferJob::result, [&](KJob *j) {
-                        if (!j->error())
-                            data = static_cast<KIO::StoredTransferJob *>(j)->data();
-                        loop.quit();
-                    });
-                    job->start();
-                }, Qt::QueuedConnection);
-
-                loop.exec();
+                bool ok = false;
+                QByteArray data = KioHelper::fetchViaKio(url, 15000, &ok);
+                if (cancelled->load()) return;
 
                 if (!data.isEmpty()) {
                     if (isVideo) {
                         img = VideoUtils::extractFirstFrameFromData(data);
+                        if (img.isNull()) {
+                            img = VideoUtils::generateVideoPlaceholder(640, 640);
+                        }
                     } else {
-                        img.loadFromData(data);
+                        img = KioHelper::decodeImageWithAutoTransform(data);
                     }
                 }
             }
 
             // Save into disk cache (LRU up to 20 images)
-            if (!img.isNull()) {
+            if (!img.isNull() && !cancelled->load()) {
                 ImageDiskCache::put(urlStr, img, 20);
             }
         }
+
+        if (cancelled->load()) return;
 
         if (requestedSize.isValid() && !img.isNull()) {
             img = img.scaled(requestedSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
         }
 
-        m_image = img;
-        emit finished();
+        if (cancelled->load()) return;
+
+        QMetaObject::invokeMethod(qApp, [self, cancelled, img]() {
+            if (self && !cancelled->load()) {
+                self->m_image = img;
+                emit self->finished();
+            }
+        });
     });
+}
+
+void FullImageResponse::cancel()
+{
+    if (m_cancelled) {
+        m_cancelled->store(true);
+    }
 }
 
 QQuickTextureFactory *FullImageResponse::textureFactory() const

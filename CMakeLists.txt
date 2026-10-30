@@ -15,7 +15,6 @@ include(KDEInstallDirs)
 include(KDECMakeSettings)
 include(KDECompilerSettings NO_POLICY_SCOPE)
 
-find_package(Qt6Core REQUIRED)
 find_package(Qt6 REQUIRED COMPONENTS
     Core
     Widgets
@@ -58,7 +57,7 @@ target_link_libraries(kamera
 )
 
 # Theme.qml is a singleton QML type.
-# We must set QT_QML_SINGLETON_TYPE on qml/Theme.qml before qt_add_qml_module
+# We set QT_QML_SINGLETON_TYPE on qml/Theme.qml before qt_add_qml_module
 # so that the generated qmldir includes "singleton Theme 1.0 qml/Theme.qml".
 set_source_files_properties(qml/Theme.qml PROPERTIES
     QT_QML_SINGLETON_TYPE TRUE

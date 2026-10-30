@@ -2,6 +2,7 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QIcon>
+#include <QCommandLineParser>
 #include <cstdlib>
 
 #include "gallerymodel.h"
@@ -12,12 +13,22 @@
 
 int main(int argc, char *argv[])
 {
+    // Check for verbose flag
+    bool verbose = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+            verbose = true;
+            break;
+        }
+    }
+
     // Initialize file logging (captures all Qt/QML logs to ~/.local/share/kamera/kamera.log)
-    Logger::init();
+    Logger::init(verbose);
 
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("Kamera"));
     app.setOrganizationName(QStringLiteral("kamera"));
+    app.setDesktopFileName(QStringLiteral("kamera"));
     app.setWindowIcon(QIcon::fromTheme(QStringLiteral("camera-photo")));
 
     qmlRegisterType<GalleryModel>("kamera", 1, 0, "GalleryModel");
@@ -30,8 +41,7 @@ int main(int argc, char *argv[])
     // Image provider for original full-resolution images (local & KIO)
     engine.addImageProvider(QStringLiteral("full"), new FullImageProvider);
 
-    // FileOps has no per-instance state and the app needs exactly one —
-    // expose it as a context property rather than a qml-constructible type.
+    // FileOps context property
     FileOps fileOps;
     engine.rootContext()->setContextProperty(QStringLiteral("fileOps"), &fileOps);
 
