@@ -56,7 +56,12 @@ Item {
                     width: parent.width / 2
                     height: parent.height
                     active: root.model.viewMode === "folder"
-                    onClicked: root.model.viewMode = "folder"
+                    onClicked: {
+                        root.model.viewMode = "folder"
+                        if (root.model.activeFolder === "" && root.model.watchedFolders.length > 0) {
+                            root.model.activeFolder = root.model.watchedFolders[0]
+                        }
+                    }
                 }
             }
         }

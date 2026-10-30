@@ -196,9 +196,9 @@ void GalleryModel::initDb()
     // Migration in case column doesn't exist yet
     q.exec(QStringLiteral("ALTER TABLE photos ADD COLUMN thumb_failed INTEGER DEFAULT 0;"));
 
+    q.exec(QStringLiteral("CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_url ON photos(url);"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder);"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken);"));
-    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_photos_url ON photos(url);"));
 
     q.exec(QStringLiteral(R"sql(
         CREATE TABLE IF NOT EXISTS watched_folders (
@@ -217,6 +217,21 @@ void GalleryModel::initDb()
     if (q.exec(QStringLiteral("SELECT path FROM watched_folders"))) {
         while (q.next())
             m_watchedFolders << q.value(0).toString();
+    }
+
+    // Migration: update photos whose folder was previously saved as just base folderName
+    for (const QString &wf : std::as_const(m_watchedFolders)) {
+        QString trimmedWf = wf;
+        while (trimmedWf.endsWith(QLatin1Char('/')))
+            trimmedWf.chop(1);
+        const QString baseName = QUrl(trimmedWf).fileName();
+        if (!baseName.isEmpty()) {
+            QSqlQuery upd(m_db);
+            upd.prepare(QStringLiteral("UPDATE photos SET folder = ? WHERE folder = ?"));
+            upd.addBindValue(wf);
+            upd.addBindValue(baseName);
+            upd.exec();
+        }
     }
 }
 
@@ -261,12 +276,44 @@ void GalleryModel::loadFromDb()
     emit countChanged();
 }
 
+static bool folderMatches(const PhotoEntry &e, const QString &activeFolder)
+{
+    if (activeFolder.isEmpty()) return true;
+
+    QString normActive = activeFolder;
+    while (normActive.endsWith(QLatin1Char('/')))
+        normActive.chop(1);
+
+    QString normFolder = e.folder;
+    while (normFolder.endsWith(QLatin1Char('/')))
+        normFolder.chop(1);
+
+    // 1. Direct match (normalized, case-insensitive)
+    if (normFolder.compare(normActive, Qt::CaseInsensitive) == 0)
+        return true;
+
+    // 2. Photo URL is located inside activeFolder directory tree
+    const QString urlStr = e.url.toString();
+    if (urlStr.startsWith(normActive + QLatin1Char('/'), Qt::CaseInsensitive) ||
+        urlStr.startsWith(normActive, Qt::CaseInsensitive))
+    {
+        return true;
+    }
+
+    // 3. Fallback for legacy DB rows where folder was stored as base folder name (e.g. "Camera")
+    const QString baseActive = QUrl(normActive).fileName();
+    if (!baseActive.isEmpty() && normFolder.compare(baseActive, Qt::CaseInsensitive) == 0)
+        return true;
+
+    return false;
+}
+
 void GalleryModel::applyFilter()
 {
     m_filtered.clear();
     if (m_viewMode == QLatin1String("folder") && !m_activeFolder.isEmpty()) {
         for (const PhotoEntry &e : std::as_const(m_all)) {
-            if (e.folder == m_activeFolder)
+            if (folderMatches(e, m_activeFolder))
                 m_filtered.append(e);
         }
     } else {
@@ -894,6 +941,11 @@ void GalleryModel::setViewMode(const QString &mode)
     if (m_viewMode == mode) return;
     m_viewMode = mode;
     emit viewModeChanged();
+
+    if (m_viewMode == QLatin1String("folder") && m_activeFolder.isEmpty() && !m_watchedFolders.isEmpty()) {
+        m_activeFolder = m_watchedFolders.first();
+        emit activeFolderChanged();
+    }
 
     beginResetModel();
     applyFilter();

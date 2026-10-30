@@ -58,7 +58,8 @@ Item {
 
                 readonly property bool isActive:
                     root.model.viewMode === "folder" &&
-                    root.model.activeFolder === modelData
+                    (root.model.activeFolder === modelData ||
+                     root.model.activeFolder.replace(/\/$/, "") === modelData.toString().replace(/\/$/, ""))
 
                 Rectangle {
                     anchors.fill: parent
@@ -66,6 +67,15 @@ Item {
                     anchors.rightMargin: 8
                     radius: Theme.radiusSmall
                     color: delegateRoot.isActive ? Theme.surfaceRaised : "transparent"
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        root.model.viewMode = "folder"
+                        root.model.activeFolder = modelData
+                    }
                 }
 
                 RowLayout {
@@ -92,15 +102,6 @@ Item {
                         onClicked: root.model.removeWatchedFolder(modelData)
                         ToolTip.text: qsTr("Stop watching this folder")
                         ToolTip.visible: hovered
-                    }
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    z: -1
-                    onClicked: {
-                        root.model.viewMode = "folder"
-                        root.model.activeFolder = modelData
                     }
                 }
             }
