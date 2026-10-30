@@ -217,15 +217,7 @@ Item {
 
     readonly property var currentEntry: {
         if (currentIndex < 0 || !root.model) return null
-        var idx = root.model.index(currentIndex, 0)
-        return {
-            id:         root.model.data(idx, 256), // IdRole
-            url:        root.model.data(idx, 257), // UrlRole
-            filename:   root.model.data(idx, 258), // FilenameRole
-            isVideo:    Boolean(root.model.data(idx, 262)), // IsVideoRole
-            localThumb: root.model.data(idx, 263), // LocalThumbRole
-            hasThumb:   Boolean(root.model.data(idx, 264))  // HasThumbRole
-        }
+        return root.model.get(currentIndex)
     }
 
     // ── Top bar: filename + zoom indicator + close ──

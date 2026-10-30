@@ -5,39 +5,77 @@
 #include <QImage>
 #include <QImageReader>
 #include <QBuffer>
-#include <QEventLoop>
-#include <QTimer>
+#include <QPointer>
 #include <QCoreApplication>
 #include <KIO/StoredTransferJob>
 
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <atomic>
+
 namespace KioHelper
 {
-    // Fetches remote data via KIO safely with a timeout and thread synchronization
-    inline QByteArray fetchViaKio(const QUrl &url, int timeoutMs = 15000, bool *ok = nullptr)
+    struct KioTask {
+        std::mutex mtx;
+        std::condition_variable cv;
+        QByteArray data;
+        bool finished = false;
+        bool success = false;
+        QPointer<KIO::StoredTransferJob> job;
+    };
+
+    // Safely fetches remote data via KIO from any thread using heap-allocated context,
+    // condition variables, and responsive cancellation.
+    inline QByteArray fetchViaKio(const QUrl &url, int timeoutMs = 15000, bool *ok = nullptr, std::atomic<bool> *cancelFlag = nullptr)
     {
         if (ok) *ok = false;
-        QByteArray data;
-        bool success = false;
-        QEventLoop loop;
+        if (cancelFlag && cancelFlag->load()) return {};
 
-        QMetaObject::invokeMethod(qApp, [&]() {
+        auto task = std::make_shared<KioTask>();
+
+        QMetaObject::invokeMethod(qApp, [task, url]() {
             auto *job = KIO::storedGet(url, KIO::NoReload, KIO::HideProgressInfo);
-            QObject::connect(job, &KIO::StoredTransferJob::result, &loop, [&data, &success, &loop](KJob *j) {
+            task->job = job;
+            QObject::connect(job, &KIO::StoredTransferJob::result, [task](KJob *j) {
+                std::unique_lock<std::mutex> lock(task->mtx);
                 if (!j->error()) {
-                    data = static_cast<KIO::StoredTransferJob *>(j)->data();
-                    success = true;
+                    task->data = static_cast<KIO::StoredTransferJob *>(j)->data();
+                    task->success = true;
                 }
-                loop.quit();
-            }, Qt::QueuedConnection);
-
-            QTimer::singleShot(timeoutMs, &loop, &QEventLoop::quit);
+                task->finished = true;
+                task->cv.notify_all();
+            });
             job->start();
-        }, Qt::QueuedConnection);
+        });
 
-        loop.exec();
+        std::unique_lock<std::mutex> lock(task->mtx);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
 
-        if (ok) *ok = success;
-        return data;
+        while (!task->finished) {
+            if (cancelFlag && cancelFlag->load()) {
+                break;
+            }
+            if (task->cv.wait_until(lock, std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(100))) == std::cv_status::timeout) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+            }
+        }
+
+        if (!task->finished) {
+            // Cancelled or timed out: kill the job quietly on the main thread so socket resources release cleanly
+            QMetaObject::invokeMethod(qApp, [task]() {
+                if (task->job) {
+                    task->job->kill(KJob::Quietly);
+                }
+            });
+            return {};
+        }
+
+        if (ok) *ok = task->success;
+        return task->data;
     }
 
     // Decodes image data from memory while honoring EXIF orientation

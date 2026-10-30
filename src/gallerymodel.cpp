@@ -749,6 +749,23 @@ QVariantMap GalleryModel::exifForIndex(int idx) const
     return map;
 }
 
+QVariantMap GalleryModel::get(int idx) const
+{
+    if (idx < 0 || idx >= m_filtered.size()) return {};
+    const PhotoEntry &e = m_filtered.at(idx);
+    QVariantMap map;
+    map[QStringLiteral("id")]         = e.id;
+    map[QStringLiteral("url")]        = e.url.toString();
+    map[QStringLiteral("filename")]   = e.filename;
+    map[QStringLiteral("dateTaken")]  = e.dateTaken;
+    map[QStringLiteral("folder")]     = e.folder;
+    map[QStringLiteral("fileSize")]   = e.fileSize;
+    map[QStringLiteral("isVideo")]    = e.isVideo;
+    map[QStringLiteral("localThumb")] = e.localThumb;
+    map[QStringLiteral("hasThumb")]   = e.hasThumb;
+    return map;
+}
+
 int GalleryModel::indexOfId(const QString &id) const
 {
     if (id.isEmpty()) return -1;
@@ -781,11 +798,8 @@ void GalleryModel::preloadNeighbors(int current, int distance)
 {
     if (current < 0 || m_filtered.isEmpty() || distance <= 0) return;
 
-    // Cancel any previous preload to prioritize current view
+    // Signal abort to any in-flight preload so it terminates promptly
     m_preloadAbort.store(true);
-    if (m_preloadWatcher && m_preloadWatcher->isRunning()) {
-        m_preloadWatcher->cancel();
-    }
 
     struct PreloadTarget {
         QUrl url;
@@ -800,7 +814,6 @@ void GalleryModel::preloadNeighbors(int current, int distance)
 
         if (nextIdx >= 0 && nextIdx < total) {
             const PhotoEntry &e = m_filtered.at(nextIdx);
-            // Skip local files (they load directly and do not need disk cache)
             if (!e.url.isLocalFile()) {
                 targets.append({e.url, e.isVideo});
             }
@@ -817,14 +830,14 @@ void GalleryModel::preloadNeighbors(int current, int distance)
 
     m_preloadAbort.store(false);
 
-    auto future = QtConcurrent::run([targets, this]() {
+    QThreadPool::globalInstance()->start([targets, this]() {
         for (const auto &target : targets) {
             if (m_preloadAbort.load() || m_abort.load()) break;
             const QString urlStr = target.url.toString();
             if (ImageDiskCache::contains(urlStr)) continue;
 
             bool ok = false;
-            QByteArray data = KioHelper::fetchViaKio(target.url, 15000, &ok);
+            QByteArray data = KioHelper::fetchViaKio(target.url, 10000, &ok, &m_preloadAbort);
             if (m_preloadAbort.load() || m_abort.load()) break;
 
             QImage img;
@@ -839,13 +852,11 @@ void GalleryModel::preloadNeighbors(int current, int distance)
                 }
             }
 
-            if (!img.isNull() && !m_preloadAbort.load()) {
+            if (!img.isNull() && !m_preloadAbort.load() && !m_abort.load()) {
                 ImageDiskCache::put(urlStr, img, 20);
             }
         }
     });
-
-    m_preloadWatcher->setFuture(future);
 }
 
 // ── Grouping ──────────────────────────────────

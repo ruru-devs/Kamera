@@ -74,6 +74,7 @@ public:
     // ID / Index helpers for viewer tracking
     Q_INVOKABLE int indexOfId(const QString &id) const;
     Q_INVOKABLE QString idForIndex(int index) const;
+    Q_INVOKABLE QVariantMap get(int index) const;
 
     // Navigation
     Q_INVOKABLE int nextIndex(int current) const;

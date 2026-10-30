@@ -19,12 +19,10 @@ ThumbnailProvider::ThumbnailProvider()
 // percent-encoded by QML callers (Image { source: "image://thumb/" + localThumb })
 QImage ThumbnailProvider::requestImage(const QString &id, QSize *size, const QSize &requestedSize)
 {
-    // QML passes the path directly; decode any percent-encoding
     QString path = QUrl::fromPercentEncoding(id.toUtf8());
 
     QImage img(path);
     if (img.isNull()) {
-        // Return a tiny placeholder so QML doesn't spin forever
         QImage placeholder(1, 1, QImage::Format_ARGB32);
         placeholder.fill(Qt::transparent);
         if (size) *size = placeholder.size();
@@ -74,7 +72,7 @@ FullImageResponse::FullImageResponse(const QString &id, const QSize &requestedSi
             } else {
                 // Remote file (e.g. kdeconnect://): fetch data via KIO
                 bool ok = false;
-                QByteArray data = KioHelper::fetchViaKio(url, 15000, &ok);
+                QByteArray data = KioHelper::fetchViaKio(url, 15000, &ok, cancelled.get());
                 if (cancelled->load()) return;
 
                 if (!data.isEmpty()) {
@@ -103,12 +101,14 @@ FullImageResponse::FullImageResponse(const QString &id, const QSize &requestedSi
 
         if (cancelled->load()) return;
 
-        QMetaObject::invokeMethod(qApp, [self, cancelled, img]() {
-            if (self && !cancelled->load()) {
-                self->m_image = img;
-                emit self->finished();
-            }
-        });
+        if (self) {
+            QMetaObject::invokeMethod(self, [self, cancelled, img]() {
+                if (self && !cancelled->load()) {
+                    self->m_image = img;
+                    emit self->finished();
+                }
+            });
+        }
     });
 }
 
